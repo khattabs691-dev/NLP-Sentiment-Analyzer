@@ -3,4 +3,7 @@ pandas
 matplotlib
 nltk
 thefuzz
-openpyxl
+python-Levenshtein
+scikit-learn
+transformers
+torch
