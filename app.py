@@ -205,7 +205,7 @@ with ui.Blocks(title="NLP Project", theme=ui.themes.Soft()) as app:
             search_btn.click(search_in_dataset_with_history, query_input, [results_out, history_output])
             
         with ui.TabItem("Analytics Dashboard 📊"):
-            dash_query = ui.Textbox(label="Filter stats by feature (Optional)", placeholder="e.g., Battery, Screen, Camera")
+            dash_query = ui.Textbox(label="Filter stats by feature (Optional)", placeholder="e.g., food,tea")
             dashboard_btn = ui.Button("Show Chart 🚀")
             plot_output = ui.Plot(label="Sentiment Distribution")
             dashboard_btn.click(generate_dashboard, inputs=dash_query, outputs=plot_output)
