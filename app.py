@@ -72,19 +72,55 @@ model_name = "sshleifer/distilbart-cnn-12-6"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 sum_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 
+# def analyze_and_summarize_review(raw_text):
+#     cleaned = clean_html_tags(raw_text)
+#     processed = preprocess_text(cleaned)
+    
+#     text_tfidf = tfidf.transform([processed])
+#     sentiment_prediction = model.predict(text_tfidf)[0]
+    
+#     if len(raw_text.split()) > 10:
+#         inputs = tokenizer([raw_text], max_length=1024, return_tensors="pt", truncation=True)
+#         summary_ids = sum_model.generate(inputs["input_ids"], max_length=30, min_length=5, length_penalty=2.0, num_beams=4, early_stopping=True)
+#         summary_text = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+#     else:
+#         summary_text = "النص قصير جداً ولا يحتاج إلى تلخيص."
+        
+#     return {
+#         "الملخص الذكي (Summary)": summary_text,
+#         "تحليل المشاعر (Sentiment)": sentiment_prediction
+#     }
 def analyze_and_summarize_review(raw_text):
     cleaned = clean_html_tags(raw_text)
     processed = preprocess_text(cleaned)
     
+    # 1. تحليل المشاعر
     text_tfidf = tfidf.transform([processed])
     sentiment_prediction = model.predict(text_tfidf)[0]
     
-    if len(raw_text.split()) > 10:
+    # 2. حساب عدد كلمات النص المدخل
+    word_count = len(raw_text.split())
+    
+    # الشرط الحاسم الذي طلبته: إذا كان أكبر من 15 كلمة يلخص، غير ذلك يطبع الرسالة
+    if word_count > 10:
         inputs = tokenizer([raw_text], max_length=1024, return_tensors="pt", truncation=True)
-        summary_ids = sum_model.generate(inputs["input_ids"], max_length=30, min_length=5, length_penalty=2.0, num_beams=4, early_stopping=True)
+        
+        # بارامترات صارمة تمنع النموذج من زيادة أي كلام أو تأليف
+        summary_ids = sum_model.generate(
+            inputs["input_ids"], 
+            max_new_tokens=20,           # حد أقصى صغير جداً للملخص ليجبره على الاختصار الشديد
+            no_repeat_ngram_size=2,      # يمنع تكرار العبارات نهائياً
+            num_beams=2,                 # تقليل عدد الاحتمالات لمنع التخريف
+            early_stopping=True
+        )
         summary_text = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+        
+        # حماية إضافية: لو الموديل هلوَس برضه وطلع التلخيص أطول أو مساوي للنص الأصلي، يعرض النص الأصلي فقط
+        if len(summary_text.split()) >= word_count:
+            summary_text = raw_text.strip()
     else:
-        summary_text = "النص قصير جداً ولا يحتاج إلى تلخيص."
+        # إذا كان 15 كلمة أو أقل، يطبع هذه الرسالة مباشرة ولا يشغل نموذج التلخيص
+        summary_text = "The text is too short to require summarization. / النص قصير جداً ولا يحتاج إلى تلخيص."
         
     return {
         "الملخص الذكي (Summary)": summary_text,
