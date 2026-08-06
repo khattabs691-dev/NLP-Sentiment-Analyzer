@@ -1,13 +1,31 @@
 ---
-title: NLP Sentiment Analyzer
-emoji: 🏢
+title: LSTM Sentiment Analysis
+emoji: 📝
 colorFrom: pink
-colorTo: gray
+colorTo: purple
 sdk: gradio
-sdk_version: 6.14.0
-python_version: '3.13'
+sdk_version: 5.44.1
 app_file: app.py
 pinned: false
+python_version: 3.10
 ---
 
-Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+# LSTM Sentiment Analysis and DistilBART Summarization
+
+This Space uses:
+
+- A trained LSTM model for sentiment analysis.
+- DistilBART for text summarization.
+- Gradio for the web interface.
+
+Required files:
+
+- `app.py`
+- `requirements.txt`
+- `lstm_sentiment_model.keras`
+- `text_tokenizer.pkl`
+- `label_encoder.pkl`
+
+Optional file:
+
+- `Reviews.csv`
