@@ -1,9 +1,12 @@
 gradio
 pandas
+numpy
 matplotlib
 nltk
 thefuzz
 python-Levenshtein
 scikit-learn
+tensorflow-cpu
 transformers
 torch
+sentencepiece
