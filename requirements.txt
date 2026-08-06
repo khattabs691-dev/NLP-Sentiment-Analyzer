@@ -1,13 +1,13 @@
-numpy==1.26.4
-pandas==2.2.2
-matplotlib==3.9.2
-nltk==3.9.1
-thefuzz==0.22.1
-python-Levenshtein==0.25.1
-scikit-learn==1.5.2
-tensorflow-cpu==2.16.1
-transformers==5.14.1
-torch==2.5.1
-sentencepiece==0.2.0
-accelerate==1.2.1
-protobuf==3.20.3
+---
+title: LSTM Sentiment Analysis
+emoji: 📝
+colorFrom: pink
+colorTo: purple
+sdk: gradio
+sdk_version: "6.20.0"
+app_file: app.py
+pinned: false
+python_version: "3.12"
+---
+
+# LSTM Sentiment Analysis and DistilBART Summarization
