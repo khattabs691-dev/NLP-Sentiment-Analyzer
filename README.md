@@ -11,3 +11,15 @@ python_version: "3.10"
 ---
 
 # LSTM Sentiment Analysis and DistilBART Summarization
+
+Required files:
+
+- app.py
+- requirements.txt
+- lstm_sentiment_model.keras
+- text_tokenizer.pkl
+- label_encoder.pkl
+
+Optional:
+
+- Reviews.csv
