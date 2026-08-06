@@ -1,13 +1,19 @@
----
-title: LSTM Sentiment Analysis
-emoji: 📝
-colorFrom: pink
-colorTo: purple
-sdk: gradio
-sdk_version: "6.20.0"
-app_file: app.py
-pinned: false
-python_version: "3.12"
----
+numpy==2.0.2
+pandas==2.2.2
+matplotlib==3.10.0
+nltk==3.9.1
+thefuzz==0.22.1
+scikit-learn==1.6.1
 
-# LSTM Sentiment Analysis and DistilBART Summarization
+tensorflow-cpu==2.20.0
+keras==3.13.2
+protobuf==5.29.6
+
+transformers==5.13.1
+accelerate==1.14.0
+huggingface-hub==1.23.0
+tokenizers==0.22.2
+sentencepiece==0.2.2
+safetensors==0.8.0
+
+torch @ https://download.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
