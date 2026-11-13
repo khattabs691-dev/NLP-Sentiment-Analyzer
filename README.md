@@ -11,6 +11,7 @@ python_version: "3.12"
 ---
 
 
+
 # Sentiment Analysis & Smart Summarization
 
 An NLP web app that reads a product or service review and returns:
@@ -42,6 +43,52 @@ An NLP web app that reads a product or service review and returns:
 2. **Classification.** The tokenizer turns the text into a sequence, which is padded to the model's input length and passed to the LSTM. The label encoder maps the output back to a class name.
 3. **Summarization.** Reviews longer than 15 words are summarized with DistilBART. Shorter reviews are returned unchanged. The DistilBART model is loaded only on the first request, so the app starts faster.
 
+## Model & training
+
+The full training pipeline is in [`training.ipynb`](training.ipynb). It was run on Google Colab.
+
+| Setting | Value |
+|---|---|
+| Data | First 100,000 valid rows of `Reviews.csv` |
+| Split | 68,000 train / 12,000 validation / 20,000 test (stratified, `random_state=42`) |
+| Tokenizer | Keras `Tokenizer`, vocabulary 20,000, `<OOV>` token, fit on training data only |
+| Sequence length | 111 tokens (95th percentile of training review lengths) |
+| Architecture | Embedding (128) → LSTM (64, dropout 0.2) → Dense (64, ReLU) → Dropout (0.3) → Dense (3, softmax) |
+| Parameters | 2,613,763 |
+| Optimizer / loss | Adam / sparse categorical cross-entropy |
+| Class imbalance | Balanced class weights (negative 2.22, neutral 4.16, positive 0.43) |
+| Training | Batch size 128, up to 12 epochs, EarlyStopping (patience 3) and ReduceLROnPlateau. Training stopped at epoch 7 and kept the weights from epoch 4. |
+
+## Results
+
+These are the results recorded in the outputs of [`training.ipynb`](training.ipynb), evaluated on its held-out **test set (20,000 reviews)**:
+
+| Class | Precision | Recall | F1-score | Support |
+|---|---|---|---|---|
+| Negative | 0.7241 | 0.7588 | 0.7410 | 2,998 |
+| Neutral | 0.3583 | 0.6640 | 0.4655 | 1,604 |
+| Positive | 0.9592 | 0.8650 | 0.9096 | 15,398 |
+| **Macro avg** | 0.6805 | 0.7626 | **0.7054** | 20,000 |
+| **Weighted avg** | 0.8757 | 0.8329 | 0.8487 | 20,000 |
+
+**Accuracy: 83.29%**
+
+Confusion matrix (rows = true class, columns = predicted class):
+
+| | Pred. negative | Pred. neutral | Pred. positive |
+|---|---|---|---|
+| **Negative** | 2,275 | 450 | 273 |
+| **Neutral** | 245 | 1,065 | 294 |
+| **Positive** | 622 | 1,457 | 13,319 |
+
+### Limitations
+
+- **The dataset is imbalanced.** About 77% of the reviews are positive and only 8% are neutral. Class weights raised neutral recall to 0.66, but neutral precision is still low (0.36). Many positive reviews are predicted as neutral (1,457 of 15,398).
+- **Accuracy alone is misleading here.** A model that always predicts "positive" would already reach about 77%. The macro F1 (0.71) is a better measure of how well the model handles all three classes.
+- **The data is limited to food products.** The model was trained only on food reviews, so it may perform worse on other kinds of reviews.
+- **DistilBART is used as-is.** It was not fine-tuned or evaluated on this dataset, so the summary quality has not been measured (for example with ROUGE).
+- **The numbers may not reproduce exactly.** No TensorFlow random seed is set, so retraining can give slightly different results. Also, the copy of `Reviews.csv` in this repository differs slightly from the copy used during training, so re-running the notebook will produce a slightly different train/test split.
+
 ## Dataset
 
 This project uses the **[Amazon Fine Food Reviews](https://www.kaggle.com/datasets/snap/amazon-fine-food-reviews)** dataset, collected by the [Stanford Network Analysis Project (SNAP)](https://snap.stanford.edu/data/web-FineFoods.html). It has 568,454 Amazon food reviews from October 1999 to October 2012.
@@ -64,6 +111,7 @@ The app loads up to 100,000 valid rows for search and the dashboard, and skips r
 
 ```
 ├── app.py                       # Gradio app: preprocessing, inference, UI
+├── training.ipynb               # Training & evaluation notebook (Colab)
 ├── lstm_sentiment_model.keras   # Trained LSTM model (Git LFS)
 ├── text_tokenizer.pkl           # Keras tokenizer fitted on the training text (Git LFS)
 ├── label_encoder.pkl            # Label encoder for the sentiment classes (Git LFS)
