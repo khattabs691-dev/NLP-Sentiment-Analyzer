@@ -12,6 +12,7 @@ python_version: "3.12"
 
 
 
+
 # Sentiment Analysis & Smart Summarization
 
 An NLP web app that reads a product or service review and returns:
@@ -21,6 +22,10 @@ An NLP web app that reads a product or service review and returns:
 - **Preprocessing steps**: the review shown at each stage (raw tokens → no punctuation → no stop words → lemmatized)
 
 🔗 **Live demo:** [Hugging Face Space](https://huggingface.co/spaces/saif2556/NLP-Sentiment-Analyzer)
+
+![App home screen](assets/app-home.png)
+
+![Analyzing a review: generated summary and predicted sentiment](assets/app-analyze.png)
 
 ---
 
@@ -112,6 +117,7 @@ The app loads up to 100,000 valid rows for search and the dashboard, and skips r
 ```
 ├── app.py                       # Gradio app: preprocessing, inference, UI
 ├── training.ipynb               # Training & evaluation notebook (Colab)
+├── assets/                      # Screenshots used in this README
 ├── lstm_sentiment_model.keras   # Trained LSTM model (Git LFS)
 ├── text_tokenizer.pkl           # Keras tokenizer fitted on the training text (Git LFS)
 ├── label_encoder.pkl            # Label encoder for the sentiment classes (Git LFS)
