@@ -1190,8 +1190,8 @@ body {
     position: relative;
     z-index: 4;
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 14px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px;
     margin-top: 30px;
 }
 
@@ -1199,7 +1199,9 @@ body {
     position: relative;
     overflow: hidden;
     min-width: 0;
-    padding: 18px;
+    padding: 24px 22px;
+    font-size: 22px;
+    letter-spacing: .04em;
     border: 1px solid rgba(255,255,255,.20);
     border-radius: 20px;
     color: white !important;
@@ -1219,9 +1221,9 @@ body {
 
 .team-card span {
     display: block;
-    margin-bottom: 6px;
+    margin-bottom: 8px;
     color: #dce7ff !important;
-    font-size: 10px;
+    font-size: 12px;
     font-weight: 850;
     letter-spacing: .12em;
     text-transform: uppercase;
@@ -2536,10 +2538,6 @@ with gr.Blocks(
                     <div class="team-card">
                         <span>Team Member</span>
                         SAIF KHATTAB
-                    </div>
-                    <div class="team-card">
-                        <span>Team Member</span>
-                        YAZEED AMEEN
                     </div>
                     <div class="team-card">
                         <span>Team Member</span>
