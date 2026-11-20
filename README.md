@@ -153,3 +153,4 @@ Python · TensorFlow / Keras · Hugging Face Transformers (PyTorch) · NLTK · p
 
 - **Saif Khattab**
 - **Aseel Mannoun**
+- **Yazeed Ameen**
