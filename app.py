@@ -14,7 +14,11 @@ import pickle
 import re
 import string
 import warnings
+import threading
+import uuid
 import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
 
 import gradio as gr
 import matplotlib.pyplot as plt
@@ -396,6 +400,143 @@ df = load_reviews_dataset()
 
 
 # =========================================================
+# Saved user reviews (persisted to a private HF Dataset repo)
+# =========================================================
+# Every review analyzed in the app is appended to a JSONL file.
+# CommitScheduler pushes that folder to a private dataset repo every few
+# minutes, so the data survives Space restarts. Without an HF_TOKEN secret
+# the app still works, but saved reviews only last until the next restart.
+
+USER_REVIEWS_REPO = os.environ.get(
+    "USER_REVIEWS_REPO", "saif2556/sentiment-user-reviews"
+)
+USER_REVIEWS_DIR = Path("user_reviews")
+USER_REVIEWS_DIR.mkdir(parents=True, exist_ok=True)
+USER_REVIEWS_FILE = USER_REVIEWS_DIR / f"reviews-{uuid.uuid4().hex}.jsonl"
+MAX_SAVED_TEXT_LENGTH = 2000
+
+HF_TOKEN = os.environ.get("HF_TOKEN")
+user_reviews_lock = threading.Lock()
+user_reviews = []
+review_scheduler = None
+
+
+def load_saved_user_reviews():
+    """Load reviews saved by earlier runs of the Space from the dataset repo."""
+    if not HF_TOKEN:
+        return []
+
+    loaded = []
+
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+
+        api = HfApi(token=HF_TOKEN)
+        files = [
+            name
+            for name in api.list_repo_files(
+                USER_REVIEWS_REPO, repo_type="dataset"
+            )
+            if name.endswith(".jsonl")
+        ]
+
+        for name in files:
+            local_path = hf_hub_download(
+                USER_REVIEWS_REPO,
+                name,
+                repo_type="dataset",
+                token=HF_TOKEN,
+            )
+            with open(local_path, "r", encoding="utf-8") as file:
+                for line in file:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("sentiment") in {"positive", "neutral", "negative"}:
+                        loaded.append(record)
+
+        print(f"Loaded {len(loaded)} saved user reviews.")
+    except Exception as error:
+        # The repo does not exist yet on the very first run, which is fine.
+        print(f"No saved user reviews loaded: {error}")
+
+    return loaded
+
+
+def start_review_scheduler():
+    if not HF_TOKEN:
+        print(
+            "HF_TOKEN secret not set: user reviews are kept in memory only "
+            "and will be lost when the Space restarts."
+        )
+        return None
+
+    try:
+        from huggingface_hub import CommitScheduler
+
+        scheduler = CommitScheduler(
+            repo_id=USER_REVIEWS_REPO,
+            repo_type="dataset",
+            folder_path=USER_REVIEWS_DIR,
+            path_in_repo="data",
+            every=2,
+            private=True,
+            token=HF_TOKEN,
+        )
+        print(f"Saving user reviews to dataset: {USER_REVIEWS_REPO}")
+        return scheduler
+    except Exception as error:
+        print(f"Could not start review saving: {error}")
+        return None
+
+
+user_reviews = load_saved_user_reviews()
+review_scheduler = start_review_scheduler()
+
+
+def save_user_review(text, sentiment, confidence):
+    record = {
+        "text": str(text).strip()[:MAX_SAVED_TEXT_LENGTH],
+        "sentiment": str(sentiment).lower(),
+        "confidence": round(float(confidence), 4),
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+    with user_reviews_lock:
+        user_reviews.append(record)
+
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+
+    try:
+        if review_scheduler is not None:
+            with review_scheduler.lock:
+                with USER_REVIEWS_FILE.open("a", encoding="utf-8") as file:
+                    file.write(line)
+        else:
+            with USER_REVIEWS_FILE.open("a", encoding="utf-8") as file:
+                file.write(line)
+    except Exception as error:
+        print(f"Could not write user review: {error}")
+
+
+def get_user_reviews_df():
+    with user_reviews_lock:
+        records = list(user_reviews)
+
+    if not records:
+        return pd.DataFrame(columns=["Text", "Sentiment"])
+
+    frame = pd.DataFrame(records)
+    return frame.rename(columns={"text": "Text", "sentiment": "Sentiment"})[
+        ["Text", "Sentiment"]
+    ]
+
+
+# =========================================================
 # Inference
 # =========================================================
 
@@ -529,6 +670,7 @@ def web_interface_fn(review_text):
         ]
 
         result = analyze_review(review_text)
+        save_user_review(review_text, result["sentiment"], result["confidence"])
 
         sentiment_text = (
             f"{result['sentiment'].upper()} "
@@ -555,20 +697,19 @@ def web_interface_fn(review_text):
         return f"Error: {error}", "", {}, "", "", "", ""
 
 
-search_history = []
-
-
-def search_in_dataset_with_history(query):
-    global search_history
+def search_in_dataset_with_history(query, search_history=None):
+    # History is kept per browser session, so visitors don't see each other's searches.
+    search_history = list(search_history or [])
 
     if df is None:
         return (
             "Reviews.csv is not available in this Space.",
             "\n".join(search_history),
+            search_history,
         )
 
     if not query or not query.strip():
-        return "Please enter a search term.", "\n".join(search_history)
+        return "Please enter a search term.", "\n".join(search_history), search_history
 
     common_keywords = [
         "battery", "screen", "camera", "price", "performance",
@@ -607,14 +748,14 @@ def search_in_dataset_with_history(query):
             f"📊 {str(row['Sentiment']).upper()}\n\n"
         )
 
-    return output, "\n".join(search_history)
+    return output, "\n".join(search_history), search_history
 
 
 def _empty_dashboard_figure(message):
     """Create a dashboard-styled empty state instead of a white Matplotlib box."""
     fig, ax = plt.subplots(figsize=(8.2, 5.2))
-    fig.patch.set_facecolor("#161b22")
-    ax.set_facecolor("#161b22")
+    fig.patch.set_facecolor("#0b1733")
+    ax.set_facecolor("#0b1733")
 
     ax.text(
         0.5,
@@ -623,7 +764,7 @@ def _empty_dashboard_figure(message):
         ha="center",
         va="center",
         fontsize=36,
-        color="#79b8ff",
+        color="#39d9ff",
         fontweight="bold",
     )
     ax.text(
@@ -633,7 +774,7 @@ def _empty_dashboard_figure(message):
         ha="center",
         va="center",
         fontsize=13,
-        color="#d0d7de",
+        color="#d9e6ff",
         fontweight="bold",
     )
 
@@ -642,27 +783,49 @@ def _empty_dashboard_figure(message):
     return fig
 
 
-def generate_dashboard(query):
-    if df is None:
-        return _empty_dashboard_figure(
-            "Reviews.csv is not available."
-        )
+DASHBOARD_SOURCES = ["Original dataset", "User reviews", "Both"]
+
+
+def generate_dashboard(query, source="Original dataset"):
+    user_df = get_user_reviews_df()
+    original_df = (
+        df[["Text", "Sentiment"]]
+        if df is not None
+        else pd.DataFrame(columns=["Text", "Sentiment"])
+    )
+
+    if source == "User reviews":
+        base_df = user_df
+        source_label = "User Reviews"
+    elif source == "Both":
+        base_df = pd.concat([original_df, user_df], ignore_index=True)
+        source_label = "Dataset + User Reviews"
+    else:
+        base_df = original_df
+        source_label = "Original Dataset"
+
+    if base_df.empty:
+        if source == "User reviews":
+            return _empty_dashboard_figure(
+                "No user reviews yet. Analyze a review first."
+            )
+        return _empty_dashboard_figure("Reviews.csv is not available.")
 
     clean_query = str(query or "").strip()
 
     if clean_query:
-        filtered_df = df[
-            df["Text"].str.contains(
+        filtered_df = base_df[
+            base_df["Text"].astype(str).str.contains(
                 clean_query,
                 case=False,
                 na=False,
                 regex=False,
             )
         ]
-        title = f"Sentiment Intelligence · {clean_query.title()}"
+        title = f"{source_label} · {clean_query.title()}"
     else:
-        filtered_df = df
-        title = "General Sentiment Intelligence"
+        filtered_df = base_df
+        title = f"{source_label} · All Reviews"
 
     if filtered_df.empty:
         return _empty_dashboard_figure(
@@ -677,15 +840,15 @@ def generate_dashboard(query):
 
     visible_counts = counts[counts > 0]
     color_map = {
-        "positive": "#79b8ff",
-        "neutral": "#c9d1d9",
-        "negative": "#1f6feb",
+        "positive": "#39d9ff",
+        "neutral": "#ffd166",
+        "negative": "#ff79c8",
     }
     chart_colors = [color_map[label] for label in visible_counts.index]
 
     fig, ax = plt.subplots(figsize=(8.4, 5.8))
-    fig.patch.set_facecolor("#161b22")
-    ax.set_facecolor("#161b22")
+    fig.patch.set_facecolor("#0b1733")
+    ax.set_facecolor("#0b1733")
 
     wedges, label_texts, percentage_texts = ax.pie(
         visible_counts.values,
@@ -700,13 +863,13 @@ def generate_dashboard(query):
         labeldistance=1.10,
         wedgeprops={
             "width": 0.34,
-            "edgecolor": "#161b22",
+            "edgecolor": "#0b1733",
             "linewidth": 3,
         },
         textprops={
             "fontsize": 11,
             "fontweight": "bold",
-            "color": "#e6edf3",
+            "color": "#eaf2ff",
         },
     )
 
@@ -733,7 +896,7 @@ def generate_dashboard(query):
         ha="center",
         va="center",
         fontsize=9,
-        color="#8b949e",
+        color="#9fb1d5",
         fontweight="bold",
     )
 
@@ -741,7 +904,7 @@ def generate_dashboard(query):
         title,
         fontsize=16,
         fontweight="bold",
-        color="#f0f3f6",
+        color="#f5f8ff",
         pad=20,
     )
 
@@ -761,14 +924,14 @@ def generate_dashboard(query):
         fontsize=10,
     )
 
-    legend.get_frame().set_facecolor("#1c2128")
-    legend.get_frame().set_edgecolor("#30363d")
+    legend.get_frame().set_facecolor("#111f42")
+    legend.get_frame().set_edgecolor("#314b88")
     legend.get_frame().set_linewidth(1.0)
     legend.get_title().set_color("#ffffff")
     legend.get_title().set_fontweight("bold")
 
     for legend_text in legend.get_texts():
-        legend_text.set_color("#c9d1d9")
+        legend_text.set_color("#d7e4ff")
 
     ax.set_aspect("equal")
     fig.subplots_adjust(left=0.05, right=0.80, top=0.86, bottom=0.08)
@@ -782,23 +945,23 @@ def generate_dashboard(query):
 
 CUSTOM_CSS = """
 :root {
-    --bg-0: #0d1117;
-    --bg-1: #11161d;
-    --bg-2: #1c2128;
-    --panel: rgba(22, 27, 34, 0.76);
-    --panel-strong: rgba(28, 33, 40, 0.88);
+    --bg-0: #050a16;
+    --bg-1: #091226;
+    --bg-2: #111d42;
+    --panel: rgba(10, 21, 47, 0.76);
+    --panel-strong: rgba(15, 30, 65, 0.88);
     --panel-soft: rgba(255, 255, 255, 0.055);
-    --text-0: #f6f8fa;
-    --text-1: #c9d1d9;
-    --text-2: #8b949e;
-    --blue: #388bfd;
-    --violet: #2f81f7;
-    --cyan: #79b8ff;
-    --teal: #d0d7de;
-    --pink: #1f6feb;
-    --amber: #c9d1d9;
-    --line: rgba(139, 148, 158, 0.18);
-    --line-strong: rgba(121, 184, 255, 0.34);
+    --text-0: #f7faff;
+    --text-1: #c6d3ed;
+    --text-2: #8fa2c7;
+    --blue: #5a7cff;
+    --violet: #8a63ff;
+    --cyan: #39d9ff;
+    --teal: #4ce5c1;
+    --pink: #ff79c8;
+    --amber: #ffd166;
+    --line: rgba(128, 160, 255, 0.18);
+    --line-strong: rgba(120, 157, 255, 0.34);
     --shadow-lg: 0 32px 100px rgba(0, 0, 0, 0.42);
     --shadow-md: 0 18px 52px rgba(0, 0, 0, 0.28);
 }
@@ -815,10 +978,10 @@ body {
     overflow-x: hidden;
     color: var(--text-0) !important;
     background:
-        radial-gradient(circle at 10% 8%, rgba(121, 184, 255, 0.17), transparent 24%),
-        radial-gradient(circle at 88% 12%, rgba(47, 129, 247, 0.19), transparent 27%),
-        radial-gradient(circle at 75% 78%, rgba(88, 166, 255, 0.10), transparent 24%),
-        radial-gradient(circle at 24% 88%, rgba(208, 215, 222, 0.08), transparent 22%),
+        radial-gradient(circle at 10% 8%, rgba(57, 217, 255, 0.17), transparent 24%),
+        radial-gradient(circle at 88% 12%, rgba(138, 99, 255, 0.19), transparent 27%),
+        radial-gradient(circle at 75% 78%, rgba(255, 121, 200, 0.10), transparent 24%),
+        radial-gradient(circle at 24% 88%, rgba(76, 229, 193, 0.08), transparent 22%),
         linear-gradient(150deg, var(--bg-0) 0%, var(--bg-1) 42%, var(--bg-2) 100%) !important;
 }
 
@@ -829,10 +992,10 @@ body {
     z-index: 0;
     pointer-events: none;
     background-image:
-        linear-gradient(rgba(139, 148, 158, 0.055) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(139, 148, 158, 0.055) 1px, transparent 1px);
+        linear-gradient(rgba(105, 135, 230, 0.055) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(105, 135, 230, 0.055) 1px, transparent 1px);
     background-size: 44px 44px;
-    mask-image: radial-gradient(circle at center, black 0%, rgba(0, 0, 0,.92) 62%, transparent 100%);
+    mask-image: radial-gradient(circle at center, black 0%, rgba(0,0,0,.92) 62%, transparent 100%);
 }
 
 .gradio-container::after {
@@ -845,11 +1008,11 @@ body {
         conic-gradient(
             from 0deg at 50% 50%,
             transparent 0deg,
-            rgba(121, 184, 255, 0.045) 60deg,
+            rgba(57, 217, 255, 0.045) 60deg,
             transparent 120deg,
-            rgba(47, 129, 247, 0.05) 200deg,
+            rgba(138, 99, 255, 0.05) 200deg,
             transparent 265deg,
-            rgba(88, 166, 255, 0.04) 330deg,
+            rgba(255, 121, 200, 0.04) 330deg,
             transparent 360deg
         );
     animation: ambientSpin 42s linear infinite;
@@ -885,7 +1048,7 @@ body {
     height: 160px;
     top: 8%;
     left: -120px;
-    background: linear-gradient(90deg, transparent, rgba(121, 184, 255,.72), transparent);
+    background: linear-gradient(90deg, transparent, rgba(57,217,255,.72), transparent);
     transform: rotate(-16deg);
 }
 
@@ -894,7 +1057,7 @@ body {
     height: 180px;
     top: 34%;
     right: -160px;
-    background: linear-gradient(90deg, transparent, rgba(47, 129, 247,.70), transparent);
+    background: linear-gradient(90deg, transparent, rgba(138,99,255,.70), transparent);
     animation-delay: -6s;
     transform: rotate(12deg);
 }
@@ -904,7 +1067,7 @@ body {
     height: 150px;
     bottom: 4%;
     left: 30%;
-    background: linear-gradient(90deg, transparent, rgba(88, 166, 255,.55), transparent);
+    background: linear-gradient(90deg, transparent, rgba(255,121,200,.55), transparent);
     animation-delay: -11s;
     transform: rotate(-7deg);
 }
@@ -914,16 +1077,16 @@ body {
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: #a5d6ff;
-    box-shadow: 0 0 16px rgba(121, 184, 255,.95);
+    background: #a8f1ff;
+    box-shadow: 0 0 16px rgba(57,217,255,.95);
     animation: dataFloat 13s ease-in-out infinite;
 }
 
 .data-dot.d1 { top: 12%; left: 15%; }
-.data-dot.d2 { top: 22%; right: 18%; background: #79b8ff; animation-delay: -2s; }
-.data-dot.d3 { top: 48%; left: 8%; background: #d0d7de; animation-delay: -4s; }
-.data-dot.d4 { top: 66%; right: 11%; background: #58a6ff; animation-delay: -7s; }
-.data-dot.d5 { bottom: 8%; left: 58%; background: #ffffff; animation-delay: -9s; }
+.data-dot.d2 { top: 22%; right: 18%; background: #b8a8ff; animation-delay: -2s; }
+.data-dot.d3 { top: 48%; left: 8%; background: #8fffe6; animation-delay: -4s; }
+.data-dot.d4 { top: 66%; right: 11%; background: #ffa7df; animation-delay: -7s; }
+.data-dot.d5 { bottom: 8%; left: 58%; background: #ffe59f; animation-delay: -9s; }
 .data-dot.d6 { top: 38%; left: 54%; animation-delay: -5s; }
 
 .topbar {
@@ -933,11 +1096,11 @@ body {
     gap: 14px;
     margin: 4px 0 14px;
     padding: 10px 14px;
-    border: 1px solid rgba(139, 148, 158, 0.15);
+    border: 1px solid rgba(130, 161, 255, 0.15);
     border-radius: 18px;
-    background: rgba(13, 17, 23, 0.58);
+    background: rgba(8, 18, 40, 0.58);
     backdrop-filter: blur(16px);
-    box-shadow: 0 10px 28px rgba(0, 0, 0,.20);
+    box-shadow: 0 10px 28px rgba(0,0,0,.20);
 }
 
 .brand {
@@ -955,7 +1118,7 @@ body {
     height: 34px;
     border-radius: 11px;
     background: linear-gradient(135deg, var(--cyan), var(--blue), var(--violet));
-    box-shadow: 0 8px 22px rgba(31, 111, 235,.35);
+    box-shadow: 0 8px 22px rgba(77,110,242,.35);
 }
 
 .brand-mark::before,
@@ -993,10 +1156,10 @@ body {
     align-items: center;
     gap: 7px;
     padding: 7px 10px;
-    border: 1px solid rgba(139, 148, 158, 0.18);
+    border: 1px solid rgba(117, 151, 255, 0.18);
     border-radius: 999px;
     color: var(--text-1);
-    background: rgba(255, 255, 255,.045);
+    background: rgba(255,255,255,.045);
     font-size: 12px;
     font-weight: 750;
 }
@@ -1006,7 +1169,7 @@ body {
     height: 7px;
     border-radius: 50%;
     background: var(--teal);
-    box-shadow: 0 0 12px rgba(208, 215, 222,.85);
+    box-shadow: 0 0 12px rgba(76,229,193,.85);
     animation: statusPulse 2.1s ease-in-out infinite;
 }
 
@@ -1014,16 +1177,16 @@ body {
     position: relative;
     overflow: hidden;
     min-height: 390px;
-    border: 1px solid rgba(255, 255, 255,.12);
+    border: 1px solid rgba(255,255,255,.12);
     border-radius: 34px;
     padding: 54px 48px 40px;
     margin: 8px 0 28px;
     color: white;
     background:
-        radial-gradient(circle at 76% 22%, rgba(255, 255, 255,.15), transparent 22%),
-        linear-gradient(135deg, rgba(34, 39, 46,.95), rgba(22, 27, 34,.94) 55%, rgba(27, 42, 65,.92));
+        radial-gradient(circle at 76% 22%, rgba(255,255,255,.15), transparent 22%),
+        linear-gradient(135deg, rgba(28,58,155,.95), rgba(95,67,210,.94) 55%, rgba(25,132,183,.92));
     backdrop-filter: blur(18px);
-    box-shadow: 0 38px 110px rgba(0, 0, 0,.55);
+    box-shadow: 0 38px 110px rgba(8,20,78,.55);
 }
 
 .hero::before {
@@ -1034,8 +1197,8 @@ body {
     top: -150px;
     right: -80px;
     border-radius: 48% 52% 61% 39% / 45% 42% 58% 55%;
-    border: 1px solid rgba(255, 255, 255,.2);
-    background: rgba(255, 255, 255,.06);
+    border: 1px solid rgba(255,255,255,.2);
+    background: rgba(255,255,255,.06);
     animation: morph 15s ease-in-out infinite;
 }
 
@@ -1047,7 +1210,7 @@ body {
     left: -80px;
     bottom: -140px;
     border-radius: 55% 45% 47% 53% / 46% 58% 42% 54%;
-    background: rgba(255, 255, 255,.08);
+    background: rgba(255,255,255,.08);
     animation: morph 19s ease-in-out infinite reverse;
 }
 
@@ -1063,10 +1226,10 @@ body {
     gap: 8px;
     margin-bottom: 16px;
     padding: 8px 11px;
-    border: 1px solid rgba(255, 255, 255,.20);
+    border: 1px solid rgba(255,255,255,.20);
     border-radius: 999px;
-    color: #f0f3f6;
-    background: rgba(255, 255, 255,.09);
+    color: #eef6ff;
+    background: rgba(255,255,255,.09);
     backdrop-filter: blur(10px);
     font-size: 12px;
     font-weight: 800;
@@ -1079,7 +1242,7 @@ body {
     height: 8px;
     border-radius: 50%;
     background: var(--cyan);
-    box-shadow: 0 0 14px rgba(121, 184, 255,.9);
+    box-shadow: 0 0 14px rgba(57,217,255,.9);
 }
 
 .hero h1 {
@@ -1088,13 +1251,13 @@ body {
     font-size: clamp(40px, 5.2vw, 64px);
     line-height: 1;
     letter-spacing: -0.055em;
-    text-shadow: 0 5px 26px rgba(0, 0, 0,.38);
+    text-shadow: 0 5px 26px rgba(10,22,85,.38);
 }
 
 .hero p {
     max-width: 760px;
     margin: 0;
-    color: #e6edf3 !important;
+    color: #e8efff !important;
     font-size: 16px;
     line-height: 1.82;
     font-weight: 520;
@@ -1111,9 +1274,9 @@ body {
 
 .metric {
     padding: 10px 12px;
-    border: 1px solid rgba(255, 255, 255,.18);
+    border: 1px solid rgba(255,255,255,.18);
     border-radius: 14px;
-    background: rgba(255, 255, 255,.09);
+    background: rgba(255,255,255,.09);
     backdrop-filter: blur(10px);
 }
 
@@ -1124,7 +1287,7 @@ body {
 }
 
 .metric span {
-    color: #d0d7de;
+    color: #dce7ff;
     font-size: 11px;
     letter-spacing: .04em;
 }
@@ -1147,17 +1310,17 @@ body {
 }
 
 .neural-line {
-    stroke: rgba(201, 209, 217,.34);
+    stroke: rgba(213,233,255,.34);
     stroke-width: 1.3;
     stroke-dasharray: 5 7;
     animation: dashFlow 9s linear infinite;
 }
 
 .neural-node {
-    fill: rgba(255, 255, 255,.14);
-    stroke: rgba(255, 255, 255,.52);
+    fill: rgba(255,255,255,.14);
+    stroke: rgba(255,255,255,.52);
     stroke-width: 1.2;
-    filter: drop-shadow(0 0 8px rgba(121, 184, 255,.35));
+    filter: drop-shadow(0 0 8px rgba(57,217,255,.35));
     animation: nodeGlow 3.8s ease-in-out infinite;
 }
 
@@ -1171,12 +1334,12 @@ body {
     align-items: center;
     gap: 7px;
     padding: 9px 11px;
-    border: 1px solid rgba(255, 255, 255,.22);
+    border: 1px solid rgba(255,255,255,.22);
     border-radius: 13px;
     color: #fff;
-    background: rgba(255, 255, 255,.10);
+    background: rgba(255,255,255,.10);
     backdrop-filter: blur(11px);
-    box-shadow: 0 10px 28px rgba(0, 0, 0,.22);
+    box-shadow: 0 10px 28px rgba(10,22,80,.22);
     font-size: 12px;
     font-weight: 800;
     animation: chipFloat 7s ease-in-out infinite;
@@ -1203,12 +1366,12 @@ body {
     font-size: 17px;
     letter-spacing: .03em;
     white-space: nowrap;
-    border: 1px solid rgba(255, 255, 255,.20);
+    border: 1px solid rgba(255,255,255,.20);
     border-radius: 20px;
     color: white !important;
-    background: linear-gradient(145deg, rgba(255, 255, 255,.17), rgba(255, 255, 255,.075));
+    background: linear-gradient(145deg, rgba(255,255,255,.17), rgba(255,255,255,.075));
     backdrop-filter: blur(14px);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255,.16);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.16);
     font-weight: 850;
     text-align: center;
     transition: transform .25s ease, border-color .25s ease, background .25s ease;
@@ -1216,14 +1379,14 @@ body {
 
 .team-card:hover {
     transform: translateY(-5px);
-    border-color: rgba(255, 255, 255,.34);
-    background: linear-gradient(145deg, rgba(255, 255, 255,.24), rgba(255, 255, 255,.11));
+    border-color: rgba(255,255,255,.34);
+    background: linear-gradient(145deg, rgba(255,255,255,.24), rgba(255,255,255,.11));
 }
 
 .team-card span {
     display: block;
     margin-bottom: 6px;
-    color: #d0d7de !important;
+    color: #dce7ff !important;
     font-size: 10px;
     font-weight: 850;
     letter-spacing: .12em;
@@ -1244,7 +1407,7 @@ body {
     padding: 23px 21px 20px;
     border: 1px solid var(--line);
     border-radius: 24px;
-    background: linear-gradient(145deg, rgba(28, 33, 40,.88), rgba(13, 17, 23,.78));
+    background: linear-gradient(145deg, rgba(18,35,75,.88), rgba(8,19,44,.78));
     backdrop-filter: blur(18px);
     box-shadow: var(--shadow-md);
     transition: transform .25s ease, border-color .25s ease, box-shadow .25s ease;
@@ -1256,7 +1419,7 @@ body {
     inset: 0;
     opacity: .42;
     background:
-        linear-gradient(120deg, transparent 0%, rgba(255, 255, 255,.03) 40%, transparent 62%);
+        linear-gradient(120deg, transparent 0%, rgba(255,255,255,.03) 40%, transparent 62%);
     transform: translateX(-120%);
     transition: transform .65s ease;
 }
@@ -1269,13 +1432,13 @@ body {
     right: -55px;
     bottom: -60px;
     border-radius: 50%;
-    background: radial-gradient(circle, rgba(121, 184, 255,.14), transparent 70%);
+    background: radial-gradient(circle, rgba(57,217,255,.14), transparent 70%);
 }
 
 .feature-card:hover {
     transform: translateY(-6px);
-    border-color: rgba(121, 184, 255,.35);
-    box-shadow: 0 22px 58px rgba(0, 0, 0,.36);
+    border-color: rgba(57,217,255,.35);
+    box-shadow: 0 22px 58px rgba(0,0,0,.36);
 }
 
 .feature-card:hover::before {
@@ -1289,8 +1452,8 @@ body {
     height: 38px;
     margin-bottom: 12px;
     border-radius: 12px;
-    background: linear-gradient(135deg, rgba(56, 139, 253,.30), rgba(121, 184, 255,.20));
-    border: 1px solid rgba(139, 148, 158,.18);
+    background: linear-gradient(135deg, rgba(90,124,255,.30), rgba(57,217,255,.20));
+    border: 1px solid rgba(140,170,255,.18);
     font-size: 18px;
 }
 
@@ -1299,7 +1462,7 @@ body {
     z-index: 1;
     display: block;
     margin-bottom: 7px;
-    color: #f0f3f6 !important;
+    color: #f5f8ff !important;
     font-size: 15px;
 }
 
@@ -1316,7 +1479,7 @@ body {
     overflow: hidden;
     border: 1px solid var(--line) !important;
     border-radius: 28px !important;
-    background: rgba(13, 17, 23,.76) !important;
+    background: rgba(6,15,36,.76) !important;
     backdrop-filter: blur(20px);
     box-shadow: var(--shadow-lg) !important;
     padding: 12px !important;
@@ -1330,69 +1493,69 @@ body {
     right: -100px;
     top: -120px;
     border-radius: 50%;
-    background: radial-gradient(circle, rgba(47, 129, 247,.12), transparent 70%);
+    background: radial-gradient(circle, rgba(138,99,255,.12), transparent 70%);
     pointer-events: none;
 }
 
 .app-tabs button[role="tab"] {
     min-height: 50px;
     border-radius: 15px !important;
-    color: #b1bac4 !important;
+    color: #b8c7e5 !important;
     font-weight: 780 !important;
     transition: all .22s ease !important;
 }
 
 .app-tabs button[role="tab"]:hover {
     color: #fff !important;
-    background: rgba(255, 255, 255,.055) !important;
+    background: rgba(255,255,255,.055) !important;
 }
 
 .app-tabs button[role="tab"][aria-selected="true"] {
     color: #fff !important;
     background: linear-gradient(135deg, var(--blue), var(--violet) 56%, var(--cyan)) !important;
-    box-shadow: 0 12px 30px rgba(31, 111, 235,.38) !important;
+    box-shadow: 0 12px 30px rgba(76,96,226,.38) !important;
 }
 
 .section-card {
-    border: 1px solid rgba(139, 148, 158,.15) !important;
+    border: 1px solid rgba(124,154,245,.15) !important;
     border-radius: 24px !important;
-    background: linear-gradient(180deg, rgba(28, 33, 40,.90), rgba(13, 17, 23,.84)) !important;
+    background: linear-gradient(180deg, rgba(18,34,72,.90), rgba(8,19,44,.84)) !important;
     backdrop-filter: blur(18px);
-    box-shadow: 0 16px 42px rgba(0, 0, 0,.24) !important;
+    box-shadow: 0 16px 42px rgba(0,0,0,.24) !important;
     padding: 18px !important;
 }
 
 .section-card h1,
 .section-card h2,
 .section-card h3 {
-    color: #f0f3f6 !important;
+    color: #f4f8ff !important;
 }
 
 .section-card p,
 .section-card label,
 .section-card span {
-    color: #c9d1d9 !important;
+    color: #c4d0e9 !important;
 }
 
 .section-card textarea,
 .section-card input {
     min-height: 49px;
-    border: 1px solid rgba(139, 148, 158,.22) !important;
+    border: 1px solid rgba(124,154,245,.22) !important;
     border-radius: 17px !important;
-    color: #f6f8fa !important;
-    background: rgba(255, 255, 255,.055) !important;
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0,.14) !important;
+    color: #f7faff !important;
+    background: rgba(255,255,255,.055) !important;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,.14) !important;
 }
 
 .section-card textarea:focus,
 .section-card input:focus {
-    border-color: rgba(121, 184, 255,.68) !important;
-    box-shadow: 0 0 0 4px rgba(121, 184, 255,.10), 0 12px 28px rgba(0, 0, 0,.16) !important;
+    border-color: rgba(57,217,255,.68) !important;
+    box-shadow: 0 0 0 4px rgba(57,217,255,.10), 0 12px 28px rgba(0,0,0,.16) !important;
 }
 
 .section-card textarea::placeholder,
 .section-card input::placeholder {
-    color: #8b949e !important;
+    color: #8496b9 !important;
     opacity: 1 !important;
 }
 
@@ -1403,24 +1566,24 @@ body {
     border-radius: 17px !important;
     color: #fff !important;
     background: linear-gradient(135deg, var(--blue) 0%, var(--violet) 55%, var(--cyan) 100%) !important;
-    box-shadow: 0 15px 34px rgba(31, 111, 235,.38) !important;
+    box-shadow: 0 15px 34px rgba(69,88,215,.38) !important;
     font-weight: 850 !important;
     transition: transform .2s ease, box-shadow .2s ease !important;
 }
 
 .primary-action:hover {
     transform: translateY(-2px) scale(1.005);
-    box-shadow: 0 20px 46px rgba(31, 111, 235,.46) !important;
+    box-shadow: 0 20px 46px rgba(69,88,215,.46) !important;
 }
 
 .secondary-action,
 .secondary-action button {
     min-height: 50px !important;
-    border: 1px solid rgba(139, 148, 158,.25) !important;
+    border: 1px solid rgba(130,160,246,.25) !important;
     border-radius: 17px !important;
-    color: #d0d7de !important;
-    background: linear-gradient(180deg, rgba(255, 255, 255,.085), rgba(255, 255, 255,.045)) !important;
-    box-shadow: 0 12px 28px rgba(0, 0, 0,.20) !important;
+    color: #dce7ff !important;
+    background: linear-gradient(180deg, rgba(255,255,255,.085), rgba(255,255,255,.045)) !important;
+    box-shadow: 0 12px 28px rgba(0,0,0,.20) !important;
     font-weight: 820 !important;
 }
 
@@ -1488,38 +1651,38 @@ footer { display: none !important; }
     top: 67%;
     bottom: auto;
     animation-delay: -5.5s;
-    border-color: rgba(208, 215, 222, 0.40);
+    border-color: rgba(76, 229, 193, 0.40);
     background: linear-gradient(
         135deg,
-        rgba(208, 215, 222, 0.20),
-        rgba(56, 139, 253, 0.15)
+        rgba(76, 229, 193, 0.20),
+        rgba(90, 124, 255, 0.15)
     );
     box-shadow:
-        0 10px 28px rgba(0, 0, 0, 0.24),
-        0 0 20px rgba(208, 215, 222, 0.10);
+        0 10px 28px rgba(10, 22, 80, 0.24),
+        0 0 20px rgba(76, 229, 193, 0.10);
 }
 
 .data-dot.d7 {
     top: 82%;
     left: 18%;
-    background: #58a6ff;
+    background: #8fa8ff;
     animation-delay: -10s;
 }
 
 .data-dot.d8 {
     top: 18%;
     left: 72%;
-    background: #c9d1d9;
+    background: #7fffe6;
     animation-delay: -6.5s;
 }
 
 .tech-ring {
     position: absolute;
     border-radius: 50%;
-    border: 1px solid rgba(139, 148, 158, 0.18);
+    border: 1px solid rgba(120, 155, 255, 0.18);
     box-shadow:
-        inset 0 0 30px rgba(56, 139, 253, 0.05),
-        0 0 24px rgba(121, 184, 255, 0.05);
+        inset 0 0 30px rgba(90, 124, 255, 0.05),
+        0 0 24px rgba(57, 217, 255, 0.05);
     animation: ringOrbit 24s linear infinite;
 }
 
@@ -1528,8 +1691,8 @@ footer { display: none !important; }
     content: "";
     position: absolute;
     border-radius: 50%;
-    background: #79b8ff;
-    box-shadow: 0 0 14px rgba(121, 184, 255, 0.85);
+    background: #78e7ff;
+    box-shadow: 0 0 14px rgba(57, 217, 255, 0.85);
 }
 
 .tech-ring::before {
@@ -1544,8 +1707,8 @@ footer { display: none !important; }
     height: 5px;
     right: 12%;
     bottom: 17%;
-    background: #58a6ff;
-    box-shadow: 0 0 14px rgba(47, 129, 247, 0.82);
+    background: #b7a6ff;
+    box-shadow: 0 0 14px rgba(138, 99, 255, 0.82);
 }
 
 .tech-ring.r1 {
@@ -1580,11 +1743,11 @@ footer { display: none !important; }
     background: linear-gradient(
         to bottom,
         transparent,
-        rgba(121, 184, 255, 0.9),
+        rgba(57, 217, 255, 0.9),
         transparent
     );
     filter: blur(0.5px);
-    box-shadow: 0 0 18px rgba(121, 184, 255, 0.35);
+    box-shadow: 0 0 18px rgba(57, 217, 255, 0.35);
     animation: scanMove 13s ease-in-out infinite;
 }
 
@@ -1603,7 +1766,7 @@ footer { display: none !important; }
     background: linear-gradient(
         to bottom,
         transparent,
-        rgba(47, 129, 247, 0.85),
+        rgba(138, 99, 255, 0.85),
         transparent
     );
 }
@@ -1660,10 +1823,10 @@ footer { display: none !important; }
     position: absolute;
     padding: 8px 12px;
     border-radius: 999px;
-    border: 1px solid rgba(139, 148, 158, 0.20);
+    border: 1px solid rgba(135, 168, 255, 0.20);
     background: rgba(255, 255, 255, 0.055);
     backdrop-filter: blur(10px);
-    color: rgba(201, 209, 217, 0.62);
+    color: rgba(223, 235, 255, 0.62);
     font-weight: 800;
     font-size: 12px;
     letter-spacing: 0.05em;
@@ -1700,19 +1863,19 @@ footer { display: none !important; }
     position: absolute;
     overflow: visible;
     opacity: 0.17;
-    filter: drop-shadow(0 0 14px rgba(121, 184, 255, 0.18));
+    filter: drop-shadow(0 0 14px rgba(57, 217, 255, 0.18));
     animation: neuralDrift 18s ease-in-out infinite;
 }
 
 .bg-neural line {
-    stroke: rgba(201, 209, 217, 0.36);
+    stroke: rgba(170, 201, 255, 0.36);
     stroke-width: 1.2;
     stroke-dasharray: 4 5;
 }
 
 .bg-neural circle {
     fill: rgba(255, 255, 255, 0.12);
-    stroke: rgba(201, 209, 217, 0.58);
+    stroke: rgba(190, 223, 255, 0.58);
     stroke-width: 1.1;
 }
 
@@ -1751,15 +1914,15 @@ footer { display: none !important; }
     top: 52%;
     bottom: auto;
     animation-delay: -5.5s;
-    border-color: rgba(208, 215, 222, 0.40);
+    border-color: rgba(76, 229, 193, 0.40);
     background: linear-gradient(
         135deg,
-        rgba(208, 215, 222, 0.20),
-        rgba(56, 139, 253, 0.15)
+        rgba(76, 229, 193, 0.20),
+        rgba(90, 124, 255, 0.15)
     );
     box-shadow:
-        0 10px 28px rgba(0, 0, 0, 0.24),
-        0 0 20px rgba(208, 215, 222, 0.10);
+        0 10px 28px rgba(10, 22, 80, 0.24),
+        0 0 20px rgba(76, 229, 193, 0.10);
 }
 
 /* make the hero network a little clearer */
@@ -1879,7 +2042,7 @@ footer { display: none !important; }
     background: transparent !important;
     box-shadow: none !important;
     border: none !important;
-    color: #d0d7de !important;
+    color: #dce7ff !important;
 }
 
 /* Keep labels readable without glowing rectangles */
@@ -1937,15 +2100,15 @@ footer { display: none !important; }
     top: 58%;
     bottom: auto;
     animation-delay: -5.5s;
-    border-color: rgba(208, 215, 222, 0.40);
+    border-color: rgba(76, 229, 193, 0.40);
     background: linear-gradient(
         135deg,
-        rgba(208, 215, 222, 0.20),
-        rgba(56, 139, 253, 0.15)
+        rgba(76, 229, 193, 0.20),
+        rgba(90, 124, 255, 0.15)
     );
     box-shadow:
-        0 10px 28px rgba(0, 0, 0, 0.24),
-        0 0 20px rgba(208, 215, 222, 0.10);
+        0 10px 28px rgba(10, 22, 80, 0.24),
+        0 0 20px rgba(76, 229, 193, 0.10);
 }
 /* c4 = Deep Learning */
 
@@ -1994,7 +2157,7 @@ footer { display: none !important; }
     height: 30vh;
     transform: rotate(8deg);
     animation-delay: -4s;
-    background: linear-gradient(to bottom, transparent, rgba(208, 215, 222,.72), transparent);
+    background: linear-gradient(to bottom, transparent, rgba(76,229,193,.72), transparent);
 }
 .scan-beam.s4 {
     right: 36%;
@@ -2002,7 +2165,7 @@ footer { display: none !important; }
     height: 28vh;
     transform: rotate(-7deg);
     animation-delay: -9s;
-    background: linear-gradient(to bottom, transparent, rgba(88, 166, 255,.60), transparent);
+    background: linear-gradient(to bottom, transparent, rgba(255,121,200,.60), transparent);
 }
 
 .tech-background .data-dot {
@@ -2015,10 +2178,10 @@ footer { display: none !important; }
 }
 
 /* More dots */
-.data-dot.d9  { top: 18%; right: 33%; background: #a5d6ff; animation-delay: -3s; }
-.data-dot.d10 { top: 84%; left: 22%; background: #79b8ff; animation-delay: -5s; }
-.data-dot.d11 { top: 33%; left: 51%; background: #d0d7de; animation-delay: -7s; }
-.data-dot.d12 { bottom: 22%; right: 28%; background: #58a6ff; animation-delay: -2s; }
+.data-dot.d9  { top: 18%; right: 33%; background: #a8f1ff; animation-delay: -3s; }
+.data-dot.d10 { top: 84%; left: 22%; background: #b8a8ff; animation-delay: -5s; }
+.data-dot.d11 { top: 33%; left: 51%; background: #8fffe6; animation-delay: -7s; }
+.data-dot.d12 { bottom: 22%; right: 28%; background: #ffa7df; animation-delay: -2s; }
 
 @keyframes badgeFloat {
     0%, 100% { transform: translateY(0) translateX(0); opacity: 0.18; }
@@ -2074,15 +2237,15 @@ footer { display: none !important; }
     top: 63% !important;
     bottom: auto !important;
     animation-delay: -5.5s !important;
-    border-color: rgba(208, 215, 222, 0.40) !important;
+    border-color: rgba(76, 229, 193, 0.40) !important;
     background: linear-gradient(
         135deg,
-        rgba(208, 215, 222, 0.20),
-        rgba(56, 139, 253, 0.15)
+        rgba(76, 229, 193, 0.20),
+        rgba(90, 124, 255, 0.15)
     ) !important;
     box-shadow:
-        0 10px 28px rgba(0, 0, 0, 0.24),
-        0 0 20px rgba(208, 215, 222, 0.10) !important;
+        0 10px 28px rgba(10, 22, 80, 0.24),
+        0 0 20px rgba(76, 229, 193, 0.10) !important;
 }
 
 /* Semantic Layer — directly below the neural network */
@@ -2210,18 +2373,18 @@ footer { display: none !important; }
     min-height: 34px !important;
     margin: 2px 0 9px 3px !important;
     padding: 7px 12px !important;
-    border: 1px solid rgba(121, 184, 255, 0.34) !important;
+    border: 1px solid rgba(137, 168, 255, 0.34) !important;
     border-radius: 11px !important;
     color: #ffffff !important;
     background:
         linear-gradient(
             135deg,
-            rgba(31, 111, 235, 0.90),
-            rgba(47, 129, 247, 0.88) 58%,
-            rgba(88, 166, 255, 0.82)
+            rgba(70, 101, 235, 0.90),
+            rgba(102, 80, 225, 0.88) 58%,
+            rgba(49, 188, 229, 0.82)
         ) !important;
     box-shadow:
-        0 8px 20px rgba(31, 111, 235, 0.24),
+        0 8px 20px rgba(48, 72, 190, 0.24),
         inset 0 1px 0 rgba(255, 255, 255, 0.16) !important;
     font-weight: 800 !important;
 }
@@ -2243,24 +2406,24 @@ footer { display: none !important; }
 /* ===== Premium dashboard chart styling ===== */
 .dashboard-plot {
     overflow: hidden !important;
-    border: 1px solid rgba(139, 148, 158, 0.22) !important;
+    border: 1px solid rgba(102, 135, 235, 0.22) !important;
     border-radius: 22px !important;
     padding: 10px !important;
     background:
         radial-gradient(
             circle at 12% 8%,
-            rgba(121, 184, 255, 0.08),
+            rgba(57, 217, 255, 0.08),
             transparent 28%
         ),
         radial-gradient(
             circle at 88% 92%,
-            rgba(47, 129, 247, 0.10),
+            rgba(138, 99, 255, 0.10),
             transparent 30%
         ),
         linear-gradient(
             145deg,
-            rgba(22, 27, 34, 0.96),
-            rgba(13, 17, 23, 0.94)
+            rgba(12, 27, 60, 0.96),
+            rgba(7, 17, 39, 0.94)
         ) !important;
     box-shadow:
         0 18px 44px rgba(0, 0, 0, 0.24),
@@ -2271,7 +2434,7 @@ footer { display: none !important; }
 .dashboard-plot canvas,
 .dashboard-plot .plot-container {
     border-radius: 16px !important;
-    background: #161b22 !important;
+    background: #0b1733 !important;
 }
 
 .dashboard-plot .label-wrap,
@@ -2281,9 +2444,9 @@ footer { display: none !important; }
     background:
         linear-gradient(
             135deg,
-            rgba(31, 111, 235, 0.92),
-            rgba(47, 129, 247, 0.88),
-            rgba(88, 166, 255, 0.84)
+            rgba(74, 105, 231, 0.92),
+            rgba(114, 88, 232, 0.88),
+            rgba(49, 190, 229, 0.84)
         ) !important;
 }
 
@@ -2591,6 +2754,12 @@ with gr.Blocks(
                         placeholder="Write or paste an English food or product review...",
                     )
 
+                    gr.Markdown(
+                        "<small>Analyzed reviews are saved anonymously with their "
+                        "predicted sentiment and appear in the Analytics Dashboard. "
+                        "Please don't include personal information.</small>"
+                    )
+
                     analyze_button = gr.Button(
                         "Analyze Review",
                         variant="primary",
@@ -2669,17 +2838,26 @@ with gr.Blocks(
                         lines=12,
                     )
 
+                    search_history_state = gr.State([])
+
                     search_button.click(
                         fn=search_in_dataset_with_history,
-                        inputs=query_input,
-                        outputs=[results_output, history_output],
+                        inputs=[query_input, search_history_state],
+                        outputs=[results_output, history_output, search_history_state],
                     )
 
             with gr.Tab("📊 Analytics Dashboard"):
                 with gr.Column(elem_classes=["section-card"]):
                     gr.Markdown(
                         "### Sentiment Dashboard\n"
-                        "Filter the dataset by a feature to view its sentiment distribution."
+                        "Choose a data source and filter by a feature to view its sentiment distribution. "
+                        "User reviews are labeled by the model's prediction, not by star ratings."
+                    )
+
+                    dashboard_source = gr.Radio(
+                        choices=DASHBOARD_SOURCES,
+                        value="Original dataset",
+                        label="Data Source",
                     )
 
                     with gr.Row(equal_height=True):
@@ -2701,7 +2879,7 @@ with gr.Blocks(
 
                     dashboard_button.click(
                         fn=generate_dashboard,
-                        inputs=dashboard_query,
+                        inputs=[dashboard_query, dashboard_source],
                         outputs=plot_output,
                     )
 
